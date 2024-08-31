@@ -1,143 +1,114 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract FreelanceEscrow is Ownable, ReentrancyGuard {
-    IERC20 public usdcToken;
+contract Freelancer is Ownable(msg.sender), ReentrancyGuard {
+    IERC20 public immutable deal_token;
+    address public immutable treasury;
 
-    enum ProjectState { Initiated, Closed }
-    enum ScheduleState { Planned, Funded, Approved }
+    enum MilestoneState { Initiated, Funded, Released }
 
-    struct Schedule {
-        string shortcode;
-        string description;
-        uint256 value;
-        ScheduleState state;
-    }
-
-    struct Project {
-        address freelancer;
+    struct MilestoneData {
         address client;
-        ProjectState state;
-        uint256 totalSchedules;
-        uint256 completeSchedules;
-        uint256 value;
+        address freelancer;
+        uint256 amount;
+        MilestoneState milestone_state;
     }
 
-    mapping(string => Project) public projects;
-    mapping(string => mapping(uint256 => Schedule)) public schedules;
+    mapping(string => MilestoneData) public milestones;
+    
+    uint16 public client_fee;
+    uint16 public freelancer_fee;
 
-    address public treasuryAddress;
-    uint16 public clientFee;
-    uint16 public freelancerFee;
+    event MilestoneFund(string milestone_id, address indexed client, address freelancer, uint256 amount);
+    event MilestoneRelease(string milestone_id, address indexed client, address freelancer, uint256 amount);
+    event MilestoneCancel(string milestone_id, address indexed client, address freelancer, uint256 amount);
+    event MilestoneDispute(string milestone_id, address indexed client, address freelancer, uint256 client_amount, uint256 freelancer_amount);
 
-    event ProjectCreated(string projectId, address client, address freelancer);
-    event ScheduleAdded(string projectId, uint256 scheduleId, uint256 value);
-    event ScheduleFunded(string projectId, uint256 scheduleId, uint256 amount);
-    event ScheduleApproved(string projectId, uint256 scheduleId, uint256 amount);
-    event ProjectEnded(string projectId);
-
-    constructor(address _usdcAddress, address _treasuryAddress, address initialOwner) Ownable(initialOwner) {
-        usdcToken = IERC20(_usdcAddress);
-        treasuryAddress = _treasuryAddress;
+    constructor(address _token, address _treasury) {
+        deal_token = IERC20(_token);
+        treasury = _treasury;
+        client_fee = 0;
+        freelancer_fee = 0;
     }
 
-    function createProject(string memory projectId, address client) external {
-        require(projects[projectId].freelancer == address(0), "Project already exists");
-        projects[projectId] = Project({
-            freelancer: msg.sender,
-            client: client,
-            state: ProjectState.Initiated,
-            totalSchedules: 0,
-            completeSchedules: 0,
-            value: 0
-        });
-        emit ProjectCreated(projectId, client, msg.sender);
+    function fundMilestone(string memory milestone_id, address freelancer, uint256 _amount) external {
+        address client = msg.sender;
+        MilestoneData storage milestone = milestones[milestone_id];
+        require(_amount > 0, "Error: MileStone Amount should be bigger than zero");
+        require(milestone.milestone_state == MilestoneState.Initiated, "Error: Milestone has already been funded");
+
+        uint256 usdcAmount = _amount * (10000 + client_fee) / 10000;
+        require(deal_token.transferFrom(msg.sender, address(this), usdcAmount), "Error: USDC transfer failed");
+
+        if (client_fee > 0) {
+            require(deal_token.transfer(treasury, _amount * client_fee / 10000), "Error: Treasury transfer failed");
+        }
+        milestone.client = client;
+        milestone.freelancer = freelancer;
+        milestone.amount = _amount;
+        milestone.milestone_state = MilestoneState.Funded;
+
+        emit MilestoneFund(milestone_id, client, freelancer, _amount);
     }
 
-    function addSchedule(string memory projectId, string memory shortCode, string memory description, uint256 value) external {
-        Project storage project = projects[projectId];
-        require(project.freelancer == msg.sender, "Only freelancer can add schedules");
-        require(project.state != ProjectState.Closed, "Project is closed");
+    function releaseMilestone(string memory milestone_id) external {
+        MilestoneData storage milestone = milestones[milestone_id];
 
-        uint256 scheduleId = project.totalSchedules;
-        schedules[projectId][scheduleId] = Schedule({
-            shortcode: shortCode,
-            description: description,
-            value: value,
-            state: ScheduleState.Planned
-        });
+        require(msg.sender == milestone.client, "Unauthorized: Only Client can approve schedule");
+        require(milestone.milestone_state == MilestoneState.Funded, "Milestone is not funded");
 
-        project.totalSchedules++;
-        project.value += value;
+        uint256 freelancerAmount = milestone.amount * (10000 - freelancer_fee) / 10000;
+        require(deal_token.transfer(milestone.freelancer, freelancerAmount), "Error: Freelancer transfer failed");
+        if (freelancer_fee > 0) {
+            require(deal_token.transfer(treasury, milestone.amount - freelancerAmount), "Error: Treasury transfer failed");
+        }
 
-        emit ScheduleAdded(projectId, scheduleId, value);
+        milestone.milestone_state = MilestoneState.Released;
+
+        emit MilestoneRelease(milestone_id, milestone.client, milestone.freelancer, milestone.amount);
     }
 
-    function fundSchedule(string memory projectId, uint256 scheduleId) external nonReentrant {
-        Project storage project = projects[projectId];
-        Schedule storage schedule = schedules[projectId][scheduleId];
+    function cancelMilestone(string memory milestone_id) external onlyOwner {
+        MilestoneData storage milestone = milestones[milestone_id];
+        require(milestone.milestone_state == MilestoneState.Funded, "Milestone is not funded");
 
-        require(project.client == msg.sender, "Only client can fund schedules");
-        require(project.state == ProjectState.Initiated, "Project is not initiated");
-        require(schedule.state == ScheduleState.Planned, "Schedule is not in planned state");
+        require(deal_token.transfer(milestone.client, milestone.amount), "Error: Refund Client transfer failed");
 
-        uint256 amount = schedule.value;
-        uint256 feeAmount = (amount * clientFee) / 10000;
-        uint256 totalAmount = amount + feeAmount;
+        milestone.milestone_state = MilestoneState.Released;
 
-        require(usdcToken.transferFrom(msg.sender, address(this), totalAmount), "Transfer failed");
-
-        schedule.state = ScheduleState.Funded;
-
-        emit ScheduleFunded(projectId, scheduleId, totalAmount);
+        emit MilestoneCancel(milestone_id, milestone.client, milestone.freelancer, milestone.amount);
     }
 
-    function approveSchedule(string memory projectId, uint256 scheduleId) external nonReentrant {
-        Project storage project = projects[projectId];
-        Schedule storage schedule = schedules[projectId][scheduleId];
+    function disputeMilestone(string memory milestone_id, uint16 client_percent, uint16 freelancer_percent) external onlyOwner {
+        MilestoneData storage milestone = milestones[milestone_id];
+        require(client_percent + freelancer_percent == 10000, "Error: Percentages must sum to 10000 basis points");
+        require(milestone.milestone_state == MilestoneState.Funded, "Milestone is not funded");
+        
+        uint256 clientAmount = milestone.amount * client_percent / 10000;
+        uint256 freelancerAmount = milestone.amount * freelancer_percent / 10000;
 
-        require(project.client == msg.sender, "Only client can approve schedules");
-        require(project.state == ProjectState.Initiated, "Project is not initiated");
-        require(schedule.state == ScheduleState.Funded, "Schedule is not funded");
+        require(deal_token.transfer(milestone.client, clientAmount), "Client transfer failed");
+        require(deal_token.transfer(milestone.freelancer, freelancerAmount), "Freelancer transfer failed");
 
-        uint256 amount = schedule.value;
-        uint256 freelancerFeeAmount = (amount * freelancerFee) / 10000;
-        uint256 freelancerAmount = amount - freelancerFeeAmount;
+        milestone.milestone_state = MilestoneState.Released;
 
-        require(usdcToken.transfer(project.freelancer, freelancerAmount), "Transfer to freelancer failed");
-        require(usdcToken.transfer(treasuryAddress, freelancerFeeAmount), "Transfer to treasury failed");
-
-        schedule.state = ScheduleState.Approved;
-        project.completeSchedules++;
-
-        emit ScheduleApproved(projectId, scheduleId, amount);
+        emit MilestoneDispute(milestone_id, milestone.client, milestone.freelancer, clientAmount, freelancerAmount);
     }
 
-    function endProject(string memory projectId) external {
-        Project storage project = projects[projectId];
-        require(msg.sender == project.client || msg.sender == project.freelancer, "Unauthorized");
-        require(project.totalSchedules == project.completeSchedules, "Not all schedules are complete");
-
-        project.state = ProjectState.Closed;
-
-        emit ProjectEnded(projectId);
+    function set_clientfee(uint16 _newfee) external onlyOwner {
+        client_fee = _newfee;
     }
 
-    // Add other necessary functions (getters, setters, etc.)
-
-    function setTreasuryAddress(address _treasuryAddress) external onlyOwner {
-        treasuryAddress = _treasuryAddress;
+    function set_freelancerfee(uint16 _newfee) external onlyOwner {
+        freelancer_fee = _newfee;
     }
 
-    function setClientFee(uint16 _clientFee) external onlyOwner {
-        clientFee = _clientFee;
-    }
-
-    function setFreelancerFee(uint16 _freelancerFee) external onlyOwner {
-        freelancerFee = _freelancerFee;
+    // View functions
+    function get_milestone(string memory milestone_id) external view returns (MilestoneData memory) {
+        return milestones[milestone_id];
     }
 }
